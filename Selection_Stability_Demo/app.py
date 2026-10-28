@@ -18,17 +18,23 @@ with st.sidebar:
     training_size = st.select_slider("Training-set size", options=[100, 250, 500], value=250)
     imbalance_ratio = st.select_slider("Majority : minority ratio", options=[2, 5, 10], value=5)
     noise_percent = st.select_slider("Training-label noise", options=[0, 5, 10], value=5, format_func=lambda x: f"{x}%")
-    repeats = st.slider("Repeated training samples", min_value=5, max_value=50, value=20, step=5)
+    repeats = st.slider("Repeated training samples", min_value=20, max_value=500, value=20, step=5)
     seed = st.number_input("Random seed", min_value=0, max_value=1_000_000, value=42, step=1)
+    tie_tolerance = st.number_input("Tie tolerance (AP)", min_value=0.0, max_value=1.0, value=0.005, step=0.001, format="%.3f")
+    threshold_mode = st.selectbox("Threshold mode", ["training_f1", "fixed_0.5"], index=0)
     run_button = st.button("Run synthetic demonstration", type="primary", use_container_width=True)
 
 if run_button:
+    if repeats < 100:
+        st.warning("Fewer than 100 repeats gives wide intervals; use this for demonstration only.")
     cfg = DemoConfig(
         training_size=int(training_size),
         imbalance_ratio=int(imbalance_ratio),
         noise_percent=int(noise_percent),
         repeats=int(repeats),
         seed=int(seed),
+        tie_tolerance=float(tie_tolerance),
+        threshold_mode=threshold_mode,
     )
     with st.spinner("Running repeated inner-CV selection and clean-test evaluation..."):
         try:
@@ -55,6 +61,13 @@ else:
     c2.metric("Normalised entropy", f"{result['normalized_entropy']:.3f}")
     c3.metric("Fixed reference", result["fixed_strategy"])
     c4.metric("Fixed-reference AP gap", f"{result['fixed_reference_gap']:+.3f}")
+    st.caption(
+        f"Agreement Wilson 95% interval: {result['agreement_95_interval'][0]:.3f}–"
+        f"{result['agreement_95_interval'][1]:.3f}; entropy bootstrap 95% interval: "
+        f"{result['normalized_entropy_95_interval'][0]:.3f}–{result['normalized_entropy_95_interval'][1]:.3f}; "
+        f"gap paired bootstrap 95% interval: {result['fixed_reference_gap_95_interval'][0]:+.3f}–"
+        f"{result['fixed_reference_gap_95_interval'][1]:+.3f}"
+    )
 
     st.markdown(
         f"**Condition:** n = {cfg.training_size}; target ratio 1:{cfg.imbalance_ratio} "
@@ -78,8 +91,9 @@ else:
         "Selection frequency": "{:.1%}",
         "Mean inner-CV AP": "{:.3f}",
         "Mean clean-test AP": "{:.3f}",
-        "Mean clean-test recall @ 0.5": "{:.3f}",
-        "Mean clean-test precision @ 0.5": "{:.3f}",
+        "Mean clean-test ROC-AUC": "{:.3f}",
+        "Mean clean-test recall": "{:.3f}",
+        "Mean clean-test precision": "{:.3f}",
     }), use_container_width=True, hide_index=True)
 
     st.subheader("Repeat-level selections")

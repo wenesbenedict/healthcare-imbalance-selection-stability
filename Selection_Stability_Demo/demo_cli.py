@@ -4,7 +4,7 @@ from __future__ import annotations
 import argparse
 from pathlib import Path
 
-from demo_core import DemoConfig, run_demo
+from demo_core import VERSION, DemoConfig, feasibility_table, run_demo
 
 
 def main() -> None:
@@ -12,17 +12,28 @@ def main() -> None:
     parser.add_argument("--training-size", type=int, choices=[100, 250, 500], default=250)
     parser.add_argument("--imbalance-ratio", type=int, choices=[2, 5, 10], default=5)
     parser.add_argument("--noise", type=int, choices=[0, 5, 10], default=5, help="Training label noise percent")
-    parser.add_argument("--repeats", type=int, default=20)
+    parser.add_argument("--repeats", type=int, default=100)
     parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--tie-tolerance", type=float, default=0.005)
+    parser.add_argument("--threshold-mode", choices=["training_f1", "fixed_0.5"], default="training_f1")
+    parser.add_argument("--feasibility-table", action="store_true")
+    parser.add_argument("--version", action="version", version=VERSION)
     parser.add_argument("--output", type=Path, default=Path("demo_summary.csv"))
     args = parser.parse_args()
 
+    if args.feasibility_table:
+        print(feasibility_table().to_string(index=False))
+        return
+    if args.repeats < 100:
+        print("WARNING: Fewer than 100 repeats gives wide intervals; use this for demonstration only.")
     config = DemoConfig(
         training_size=args.training_size,
         imbalance_ratio=args.imbalance_ratio,
         noise_percent=args.noise,
         repeats=args.repeats,
         seed=args.seed,
+        tie_tolerance=args.tie_tolerance,
+        threshold_mode=args.threshold_mode,
     )
     result = run_demo(config)
     print("\nSYNTHETIC SELECTION-STABILITY DEMONSTRATION")
@@ -33,18 +44,23 @@ def main() -> None:
     print(f"Simulated training-label noise: {config.noise_percent}%")
     print(f"Repeated samples: {config.repeats}")
     print(f"Selection agreement: {result['agreement']:.3f}")
+    print(f"Selection agreement Wilson 95% interval: {result['agreement_95_interval']}")
     print(f"Normalised selection entropy: {result['normalized_entropy']:.3f}")
+    print(f"Normalised entropy bootstrap 95% interval: {result['normalized_entropy_95_interval']}")
     print(f"Fixed reference selected by pooled inner CV: {result['fixed_strategy']}")
     print(f"Mean clean-test AP (per-resample selected strategy): {result['mean_selected_test_ap']:.3f}")
     print(f"Mean clean-test AP (fixed reference): {result['mean_fixed_test_ap']:.3f}")
     print(f"Fixed-reference gap (fixed minus selected): {result['fixed_reference_gap']:+.3f}")
+    print(f"Fixed-reference gap paired bootstrap 95% interval: {result['fixed_reference_gap_95_interval']}")
+    print(f"Tie-break applied in any repeat: {result['tie_break_applied']}")
     print("\nStrategy summary:")
     print(result["summary"].to_string(index=False, formatters={
         "Selection frequency": "{:.3f}".format,
         "Mean inner-CV AP": "{:.3f}".format,
         "Mean clean-test AP": "{:.3f}".format,
-        "Mean clean-test recall @ 0.5": "{:.3f}".format,
-        "Mean clean-test precision @ 0.5": "{:.3f}".format,
+        "Mean clean-test ROC-AUC": "{:.3f}".format,
+        "Mean clean-test recall": "{:.3f}".format,
+        "Mean clean-test precision": "{:.3f}".format,
     }))
     result["summary"].to_csv(args.output, index=False)
     result["runs"].to_csv(args.output.with_name(args.output.stem + "_runs.csv"), index=False)

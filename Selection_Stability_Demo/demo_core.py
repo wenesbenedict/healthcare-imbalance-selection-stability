@@ -13,11 +13,18 @@ import numpy as np
 import pandas as pd
 from sklearn.datasets import make_classification
 from sklearn.linear_model import LogisticRegression
-from sklearn.metrics import average_precision_score, precision_score, recall_score
+from sklearn.metrics import (
+    average_precision_score,
+    f1_score,
+    precision_score,
+    recall_score,
+    roc_auc_score,
+)
 from sklearn.model_selection import StratifiedKFold, train_test_split
 from sklearn.preprocessing import StandardScaler
 
 STRATEGIES = ("No handling", "Class weights", "Random oversampling")
+VERSION = "2.0.0"
 
 
 @dataclass
@@ -25,9 +32,11 @@ class DemoConfig:
     training_size: int = 250
     imbalance_ratio: int = 5
     noise_percent: int = 5
-    repeats: int = 20
+    repeats: int = 100
     seed: int = 42
     population_size: int = 12000
+    tie_tolerance: float = 0.005
+    threshold_mode: str = "training_f1"
 
 
 def _make_population(config: DemoConfig):
@@ -97,7 +106,12 @@ def _draw_training_sample(
             to_minority = rng.choice(majority_indices, size=n_flip, replace=False)
             y_noisy[to_majority] = 0
             y_noisy[to_minority] = 1
-    return X_train, y_noisy, y_clean
+    return X_train, y_noisy, y_clean, {
+        "minority_flipped_to_majority": int(n_flip),
+        "majority_flipped_to_minority": int(n_flip),
+        "realized_minority_count": int(np.sum(y_noisy == 1)),
+        "realized_majority_count": int(np.sum(y_noisy == 0)),
+    }
 
 
 def _random_oversample(X: np.ndarray, y: np.ndarray, seed: int):
@@ -146,29 +160,102 @@ def _fit_predict_proba(
     return model.predict_proba(Xev)[:, 1]
 
 
-def _inner_cv_score(
+def _inner_cv_predictions(
     X: np.ndarray,
     y: np.ndarray,
     strategy: str,
     seed: int,
-) -> float:
-    """Mean average precision across three stratified inner folds."""
+) -> tuple[float, np.ndarray, np.ndarray]:
+    """Return mean AP and out-of-fold predictions from stratified inner CV."""
     counts = np.bincount(y.astype(int), minlength=2)
     n_splits = min(3, int(counts.min()))
     if n_splits < 2:
         raise ValueError("At least two examples per class are required for inner CV.")
     cv = StratifiedKFold(n_splits=n_splits, shuffle=True, random_state=seed)
     scores: list[float] = []
+    predictions = np.empty(len(y), dtype=float)
     for fold, (train_idx, val_idx) in enumerate(cv.split(X, y)):
         p = _fit_predict_proba(
             X[train_idx], y[train_idx], X[val_idx], strategy, seed + fold + 1
         )
         scores.append(float(average_precision_score(y[val_idx], p)))
-    return float(np.mean(scores))
+        predictions[val_idx] = p
+    return float(np.mean(scores)), y.copy(), predictions
+
+
+def _f1_threshold(y_true: np.ndarray, probabilities: np.ndarray) -> float:
+    """Choose the deterministic threshold with maximum training-only F1."""
+    candidates = np.unique(np.concatenate(([0.0], probabilities, [1.0])))
+    scores = [
+        f1_score(y_true, probabilities >= threshold, zero_division=0)
+        for threshold in candidates
+    ]
+    return float(candidates[int(np.argmax(scores))])
+
+
+def _bootstrap_interval(values: list[float], seed: int) -> tuple[float, float]:
+    rng = np.random.default_rng(seed)
+    sample = np.asarray(values, dtype=float)
+    means = np.mean(rng.choice(sample, size=(2000, len(sample)), replace=True), axis=1)
+    return float(np.percentile(means, 2.5)), float(np.percentile(means, 97.5))
+
+
+def _wilson_interval(successes: int, total: int) -> tuple[float, float]:
+    z = 1.959963984540054
+    p = successes / total
+    denominator = 1 + z**2 / total
+    center = (p + z**2 / (2 * total)) / denominator
+    margin = z * np.sqrt((p * (1 - p) + z**2 / (4 * total)) / total) / denominator
+    return float(max(0.0, center - margin)), float(min(1.0, center + margin))
+
+
+def feasibility_table(
+    population_size: int = 12000,
+) -> pd.DataFrame:
+    """Report whether each supported size/ratio condition fits the population."""
+    rows = []
+    for size in (100, 250, 500):
+        for ratio in (2, 5, 10):
+            minority = max(3, int(round(size / (ratio + 1))))
+            majority = size - minority
+            pool_minority = int(np.floor(population_size / (ratio + 1) * 0.8))
+            pool_majority = population_size - int(np.ceil(population_size / (ratio + 1) * 0.2))
+            if minority <= pool_minority and majority <= pool_majority:
+                status, reason = "feasible", "enough synthetic pool examples"
+            else:
+                status, reason = "infeasible", (
+                    f"requires {minority} minority/{majority} majority; "
+                    f"pool supports at most {pool_minority} minority/{pool_majority} majority"
+                )
+            rows.append({"Training size": size, "Ratio": ratio, "Status": status, "Reason": reason})
+    return pd.DataFrame(rows)
+
+
+def _check_feasibility(config: DemoConfig) -> None:
+    table = feasibility_table(config.population_size)
+    match = table[
+        (table["Training size"] == config.training_size)
+        & (table["Ratio"] == config.imbalance_ratio)
+    ]
+    if match.empty:
+        raise ValueError(
+            f"Condition size={config.training_size}, ratio=1:{config.imbalance_ratio} "
+            "is not supported by the synthetic population."
+        )
+    row = match.iloc[0]
+    if row["Status"] != "feasible":
+        raise ValueError(
+            f"Condition size={config.training_size}, ratio=1:{config.imbalance_ratio} "
+            f"is infeasible: {row['Reason']}."
+        )
 
 
 def run_demo(config: DemoConfig) -> dict[str, Any]:
-    """Run repeated inner-CV selection and evaluate on a clean synthetic test set."""
+    """Run repeated inner-CV selection and evaluate on a clean synthetic test set.
+
+    Scores within ``tie_tolerance`` AP of the best score are resolved in
+    simplicity order: No handling, Class weights, then Random oversampling.
+    """
     if config.training_size < 30:
         raise ValueError("Training size must be at least 30 for this demonstration.")
     if config.imbalance_ratio not in (2, 5, 10):
@@ -177,45 +264,70 @@ def run_demo(config: DemoConfig) -> dict[str, Any]:
         raise ValueError("Noise must be one of 0%, 5%, or 10%.")
     if config.repeats < 3:
         raise ValueError("Use at least three repeated samples.")
+    if config.tie_tolerance < 0:
+        raise ValueError("Tie tolerance must be non-negative.")
+    if config.threshold_mode not in ("training_f1", "fixed_0.5"):
+        raise ValueError("Threshold mode must be 'training_f1' or 'fixed_0.5'.")
 
+    _check_feasibility(config)
     X_pool, y_pool, X_test, y_test = _make_population(config)
     selected: list[str] = []
     inner_scores_by_run: list[dict[str, float]] = []
     test_scores_by_run: list[dict[str, float]] = []
     test_recalls_by_run: list[dict[str, float]] = []
     test_precisions_by_run: list[dict[str, float]] = []
+    test_roc_auc_by_run: list[dict[str, float]] = []
+    thresholds_by_run: list[float] = []
+    tie_breaks_by_run: list[bool] = []
+    noise_by_run: list[dict[str, int]] = []
 
     for repeat in range(config.repeats):
         run_seed = config.seed + 1000 + repeat * 17
-        X_train, y_train, _y_original = _draw_training_sample(
+        X_train, y_train, _y_original, noise_info = _draw_training_sample(
             X_pool, y_pool, config, run_seed
         )
+        noise_by_run.append(noise_info)
 
-        inner_scores = {
-            strategy: _inner_cv_score(
+        inner_results = {
+            strategy: _inner_cv_predictions(
                 X_train, y_train, strategy, run_seed + 500 + i
             )
             for i, strategy in enumerate(STRATEGIES)
         }
-        # Stable deterministic tie-break follows STRATEGIES order.
-        chosen = max(STRATEGIES, key=lambda name: inner_scores[name])
+        inner_scores = {strategy: result[0] for strategy, result in inner_results.items()}
+        top_score = max(inner_scores.values())
+        tied = [s for s in STRATEGIES if top_score - inner_scores[s] <= config.tie_tolerance]
+        chosen = next(s for s in STRATEGIES if s in tied)
+        tie_breaks_by_run.append(len(tied) > 1)
         selected.append(chosen)
         inner_scores_by_run.append(inner_scores)
+        thresholds = {
+            strategy: (
+                0.5
+                if config.threshold_mode == "fixed_0.5"
+                else _f1_threshold(result[1], result[2])
+            )
+            for strategy, result in inner_results.items()
+        }
+        thresholds_by_run.append(thresholds[chosen])
 
         test_scores: dict[str, float] = {}
         test_recalls: dict[str, float] = {}
         test_precisions: dict[str, float] = {}
+        test_roc_auc: dict[str, float] = {}
         for i, strategy in enumerate(STRATEGIES):
             probabilities = _fit_predict_proba(
                 X_train, y_train, X_test, strategy, run_seed + 800 + i
             )
-            pred = (probabilities >= 0.5).astype(int)
+            pred = (probabilities >= thresholds[strategy]).astype(int)
             test_scores[strategy] = float(average_precision_score(y_test, probabilities))
             test_recalls[strategy] = float(recall_score(y_test, pred, zero_division=0))
             test_precisions[strategy] = float(precision_score(y_test, pred, zero_division=0))
+            test_roc_auc[strategy] = float(roc_auc_score(y_test, probabilities))
         test_scores_by_run.append(test_scores)
         test_recalls_by_run.append(test_recalls)
         test_precisions_by_run.append(test_precisions)
+        test_roc_auc_by_run.append(test_roc_auc)
 
     counts = Counter(selected)
     frequency = {s: counts.get(s, 0) / config.repeats for s in STRATEGIES}
@@ -223,6 +335,8 @@ def run_demo(config: DemoConfig) -> dict[str, Any]:
     entropy = -sum(p * np.log(p) for p in positive_freq)
     normalized_entropy = float(entropy / np.log(len(STRATEGIES)))
     agreement = float(max(frequency.values()))
+    modal_count = max(counts.values())
+    agreement_interval = _wilson_interval(modal_count, config.repeats)
 
     # The fixed reference is selected using pooled inner-CV scores only. Test labels
     # are not used to select it; the clean test set is used only for evaluation.
@@ -230,12 +344,48 @@ def run_demo(config: DemoConfig) -> dict[str, Any]:
         s: float(np.mean([run[s] for run in inner_scores_by_run]))
         for s in STRATEGIES
     }
-    fixed_strategy = max(STRATEGIES, key=lambda name: pooled_inner[name])
+    pooled_top = max(pooled_inner.values())
+    pooled_tied = [
+        strategy
+        for strategy in STRATEGIES
+        if pooled_top - pooled_inner[strategy] <= config.tie_tolerance
+    ]
+    fixed_strategy = next(strategy for strategy in STRATEGIES if strategy in pooled_tied)
 
     selected_test_scores = [scores[name] for scores, name in zip(test_scores_by_run, selected)]
     mean_selected_test_ap = float(np.mean(selected_test_scores))
     mean_fixed_test_ap = float(np.mean([scores[fixed_strategy] for scores in test_scores_by_run]))
-    fixed_reference_gap = mean_fixed_test_ap - mean_selected_test_ap
+    paired_gaps = [
+        fixed_scores[fixed_strategy] - selected_scores[selected_name]
+        for fixed_scores, selected_scores, selected_name in zip(
+            test_scores_by_run, test_scores_by_run, selected
+        )
+    ]
+    fixed_reference_gap = float(np.mean(paired_gaps))
+    fixed_gap_interval = _bootstrap_interval(paired_gaps, config.seed + 2001)
+    entropy_bootstrap = []
+    rng = np.random.default_rng(config.seed + 2000)
+    selected_array = np.asarray(selected)
+    for sample in rng.choice(selected_array, size=(2000, config.repeats), replace=True):
+        sample_counts = np.asarray([np.mean(sample == strategy) for strategy in STRATEGIES])
+        entropy_bootstrap.append(
+            -sum(p * np.log(p) for p in sample_counts if p > 0) / np.log(len(STRATEGIES))
+        )
+    entropy_interval = (
+        max(0.0, float(np.percentile(entropy_bootstrap, 2.5))),
+        min(1.0, float(np.percentile(entropy_bootstrap, 97.5))),
+    )
+    summary_metrics = {
+        "agreement": agreement,
+        "agreement_95_low": agreement_interval[0],
+        "agreement_95_high": agreement_interval[1],
+        "normalized_entropy": normalized_entropy,
+        "normalized_entropy_95_low": entropy_interval[0],
+        "normalized_entropy_95_high": entropy_interval[1],
+        "fixed_reference_gap": fixed_reference_gap,
+        "fixed_reference_gap_95_low": fixed_gap_interval[0],
+        "fixed_reference_gap_95_high": fixed_gap_interval[1],
+    }
 
     summary_rows = []
     for strategy in STRATEGIES:
@@ -245,8 +395,10 @@ def run_demo(config: DemoConfig) -> dict[str, Any]:
                 "Selection frequency": frequency[strategy],
                 "Mean inner-CV AP": pooled_inner[strategy],
                 "Mean clean-test AP": float(np.mean([r[strategy] for r in test_scores_by_run])),
-                "Mean clean-test recall @ 0.5": float(np.mean([r[strategy] for r in test_recalls_by_run])),
-                "Mean clean-test precision @ 0.5": float(np.mean([r[strategy] for r in test_precisions_by_run])),
+                "Mean clean-test ROC-AUC": float(np.mean([r[strategy] for r in test_roc_auc_by_run])),
+                "Mean clean-test recall": float(np.mean([r[strategy] for r in test_recalls_by_run])),
+                "Mean clean-test precision": float(np.mean([r[strategy] for r in test_precisions_by_run])),
+                **summary_metrics,
             }
         )
 
@@ -260,6 +412,15 @@ def run_demo(config: DemoConfig) -> dict[str, Any]:
                 "Class weights - inner AP": inner_scores_by_run[i]["Class weights"],
                 "Random oversampling - inner AP": inner_scores_by_run[i]["Random oversampling"],
                 "Selected strategy - clean test AP": test_scores_by_run[i][strategy],
+                "Selected strategy - clean test ROC-AUC": test_roc_auc_by_run[i][strategy],
+                "Threshold": thresholds_by_run[i],
+                "Tie-break applied": tie_breaks_by_run[i],
+                "Requested noise percent": config.noise_percent,
+                **noise_by_run[i],
+                "Realized imbalance ratio": noise_by_run[i]["realized_majority_count"] / noise_by_run[i]["realized_minority_count"],
+                "Fixed-reference AP gap (fixed - selected)": (
+                    test_scores_by_run[i][fixed_strategy] - test_scores_by_run[i][strategy]
+                ),
                 "Fixed reference strategy": fixed_strategy,
             }
         )
@@ -274,6 +435,11 @@ def run_demo(config: DemoConfig) -> dict[str, Any]:
         "mean_selected_test_ap": mean_selected_test_ap,
         "mean_fixed_test_ap": mean_fixed_test_ap,
         "fixed_reference_gap": float(fixed_reference_gap),
+        "agreement_95_interval": agreement_interval,
+        "normalized_entropy_95_interval": entropy_interval,
+        "fixed_reference_gap_95_interval": fixed_gap_interval,
+        "summary_metrics": summary_metrics,
+        "tie_break_applied": any(tie_breaks_by_run),
         "summary": pd.DataFrame(summary_rows),
         "runs": pd.DataFrame(run_rows),
         "minority_count": minority_count,
@@ -281,7 +447,8 @@ def run_demo(config: DemoConfig) -> dict[str, Any]:
         "noise_definition": (
             "q% of minority labels are randomly flipped to majority, with an equal "
             "number of majority labels flipped to minority; labels are corrupted in "
-            "the training sample only. Rounding is stochastic across repeats."
+            "the training sample only. The number of flips is random (binomial) and "
+            "may be zero in low-count conditions."
         ),
         "disclaimer": (
             "Synthetic demonstration only. Results are not clinical evidence and must "
