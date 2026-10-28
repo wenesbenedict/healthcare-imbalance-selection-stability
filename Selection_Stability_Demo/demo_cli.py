@@ -39,7 +39,7 @@ def main() -> None:
     print("\nSYNTHETIC SELECTION-STABILITY DEMONSTRATION")
     print("=" * 47)
     print(f"Training size: {config.training_size}")
-    print(f"Training minority:majority ratio: 1:{config.imbalance_ratio}")
+    print(f"Training majority:minority ratio: {config.imbalance_ratio}:1")
     print(f"Approximate minority examples per sample: {result['minority_count']}")
     print(f"Simulated training-label noise: {config.noise_percent}%")
     print(f"Repeated samples: {config.repeats}")

@@ -97,6 +97,7 @@ def _draw_training_sample(
 
     # CLIMB-inspired symmetric corruption: flip k minority labels to majority and
     # the same number of majority labels to minority, preserving the class count.
+    n_flip = 0
     if config.noise_percent > 0:
         minority_indices = np.flatnonzero(y_noisy == 1)
         majority_indices = np.flatnonzero(y_noisy == 0)
@@ -219,7 +220,7 @@ def feasibility_table(
             minority = max(3, int(round(size / (ratio + 1))))
             majority = size - minority
             pool_minority = int(np.floor(population_size / (ratio + 1) * 0.8))
-            pool_majority = population_size - int(np.ceil(population_size / (ratio + 1) * 0.2))
+            pool_majority = int(np.floor(population_size * ratio / (ratio + 1) * 0.8))
             if minority <= pool_minority and majority <= pool_majority:
                 status, reason = "feasible", "enough synthetic pool examples"
             else:
@@ -239,13 +240,13 @@ def _check_feasibility(config: DemoConfig) -> None:
     ]
     if match.empty:
         raise ValueError(
-            f"Condition size={config.training_size}, ratio=1:{config.imbalance_ratio} "
+            f"Condition size={config.training_size}, ratio={config.imbalance_ratio}:1 "
             "is not supported by the synthetic population."
         )
     row = match.iloc[0]
     if row["Status"] != "feasible":
         raise ValueError(
-            f"Condition size={config.training_size}, ratio=1:{config.imbalance_ratio} "
+            f"Condition size={config.training_size}, ratio={config.imbalance_ratio}:1 "
             f"is infeasible: {row['Reason']}."
         )
 

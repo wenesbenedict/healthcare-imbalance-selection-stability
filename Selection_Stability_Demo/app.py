@@ -70,7 +70,7 @@ else:
     )
 
     st.markdown(
-        f"**Condition:** n = {cfg.training_size}; target ratio 1:{cfg.imbalance_ratio} "
+        f"**Condition:** n = {cfg.training_size}; target ratio {cfg.imbalance_ratio}:1 "
         f"(majority:minority); simulated training-label noise = {cfg.noise_percent}%; "
         f"repeats = {cfg.repeats}; approximate minority count = {result['minority_count']}."
     )
