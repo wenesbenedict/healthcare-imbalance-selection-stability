@@ -1,0 +1,19 @@
+# Python virtual environments
+**/.venv/
+**/venv/
+
+# Python cache and compiled files
+**/__pycache__/
+**/*.py[cod]
+**/.pytest_cache/
+
+# Streamlit local state
+**/.streamlit/
+
+# Generated demo output
+**/demo_summary*.csv
+
+# OS/editor junk
+**/.DS_Store
+**/.idea/
+**/.vscode/
